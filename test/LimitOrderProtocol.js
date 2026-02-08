@@ -1,17 +1,19 @@
 const hre = require('hardhat');
-const { ethers, tracer } = hre;
+const { ethers, network, tracer } = hre;
 const { expect, time, constants, getPermit2, permit2Contract } = require('@1inch/solidity-utils');
-const { fillWithMakingAmount, unwrapWethTaker, buildMakerTraits, buildMakerTraitsRFQ, buildOrder, signOrder, buildOrderData, buildTakerTraits } = require('./helpers/orderUtils');
+const { ABIOrder, fillWithMakingAmount, unwrapWethTaker, buildMakerTraits, buildMakerTraitsRFQ, buildOrder, signOrder, buildOrderData, buildTakerTraits } = require('./helpers/orderUtils');
 const { getPermit, withTarget } = require('./helpers/eip712');
-const { joinStaticCalls, ether, findTrace, countAllItems } = require('./helpers/utils');
+const { joinStaticCalls, ether, findTrace, countAllItems, withTrace, getEventArgs } = require('./helpers/utils');
 const { loadFixture } = require('@nomicfoundation/hardhat-network-helpers');
 const { deploySwapTokens, deployArbitraryPredicate } = require('./helpers/fixtures');
+const { parseUnits } = require('ethers');
 
 describe('LimitOrderProtocol', function () {
-    let addr, addr1, addr2;
+    let addr, addr1, addr2, addr3;
+    const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 
     before(async function () {
-        [addr, addr1, addr2] = await ethers.getSigners();
+        [addr, addr1, addr2, addr3] = await ethers.getSigners();
     });
 
     async function deployContractsAndInit () {
@@ -28,9 +30,16 @@ describe('LimitOrderProtocol', function () {
         await weth.approve(swap, ether('100'));
         await weth.connect(addr1).approve(swap, ether('100'));
 
-        const ETHOrders = await ethers.getContractFactory('ETHOrders');
-        contracts.ethOrders = await ETHOrders.deploy(weth, swap);
-        await contracts.ethOrders.waitForDeployment();
+        // Deploy access token for third-party cancellations
+        const TokenMock = await ethers.getContractFactory('TokenMock');
+        tokens.accessToken = await TokenMock.deploy('Access Token', 'ACCESS');
+        await tokens.accessToken.waitForDeployment();
+
+        await tokens.accessToken.mint(addr2, 1);
+
+        const NativeOrderFactory = await ethers.getContractFactory('NativeOrderFactory');
+        contracts.nativeOrderFactory = await NativeOrderFactory.deploy(weth, swap, tokens.accessToken, 60, '1inch Limit Order Protocol', '4');
+        await contracts.nativeOrderFactory.waitForDeployment();
         const orderLibFactory = await ethers.getContractFactory('OrderLib');
 
         const { arbitraryPredicate } = await deployArbitraryPredicate();
@@ -246,13 +255,14 @@ describe('LimitOrderProtocol', function () {
 
                 const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
                 const fillTx = swap.fillOrder(order, r, vs, 1, fillWithMakingAmount(1));
+                await withTrace(tracer, () => fillTx);
                 await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [1, -1]);
                 await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1], [-1, 1]);
 
                 if (hre.__SOLIDITY_COVERAGE_RUNNING === undefined) {
                     const trace = findTrace(tracer, 'CALL', await swap.getAddress());
                     const opcodes = trace.children.map(item => item.opcode);
-                    expect(countAllItems(opcodes)).to.deep.equal({ STATICCALL: 1, CALL: 2, SLOAD: 2, SSTORE: 1, LOG1: 1, MSTORE: 29, MLOAD: 10, SHA3: 5 });
+                    expect(countAllItems(opcodes)).to.deep.equal({ STATICCALL: 1, CALL: 2, SLOAD: 2, SSTORE: 1, LOG1: 1, MSTORE: 29, MLOAD: 10, RETURN: 1 });
                 }
             }
         });
@@ -272,13 +282,14 @@ describe('LimitOrderProtocol', function () {
 
             const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
             const fillTx = swap.fillOrder(order, r, vs, 1, fillWithMakingAmount(1));
+            await withTrace(tracer, () => fillTx);
             await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [1, -1]);
             await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1], [-1, 1]);
 
             if (hre.__SOLIDITY_COVERAGE_RUNNING === undefined) {
                 const trace = findTrace(tracer, 'CALL', await swap.getAddress());
                 const opcodes = trace.children.map(item => item.opcode);
-                expect(countAllItems(opcodes)).to.deep.equal({ STATICCALL: 1, CALL: 2, SLOAD: 2, SSTORE: 1, LOG1: 1, MSTORE: 31, MLOAD: 10, SHA3: 6 });
+                expect(countAllItems(opcodes)).to.deep.equal({ STATICCALL: 1, CALL: 2, SLOAD: 2, SSTORE: 1, LOG1: 1, MSTORE: 31, MLOAD: 10, RETURN: 1 });
             }
         });
 
@@ -961,45 +972,37 @@ describe('LimitOrderProtocol', function () {
 
     describe('ETH Maker Orders', function () {
         it('Partial fill', async function () {
-            const { tokens: { dai, weth }, contracts: { swap, ethOrders }, chainId } = await loadFixture(deployContractsAndInit);
+            const { tokens: { dai, weth }, contracts: { swap, nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
 
             const order = buildOrder(
                 {
-                    maker: await ethOrders.getAddress(),
+                    maker: addr1.address,
                     receiver: addr1.address,
                     makerAsset: await weth.getAddress(),
                     takerAsset: await dai.getAddress(),
                     makingAmount: ether('0.3'),
                     takingAmount: ether('300'),
                 },
-                {
-                    postInteraction: await ethOrders.getAddress(),
-                },
+                {},
             );
-            const orderHash = await swap.hashOrder(order);
 
-            const deposittx = ethOrders.connect(addr1).ethOrderDeposit(order, order.extension, { value: ether('0.3') });
-            await expect(deposittx).to.changeEtherBalance(addr1, ether('-0.3'));
-            await expect(deposittx).to.changeTokenBalance(weth, ethOrders, ether('0.3'));
+            const deposittx = nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount });
+            await expect(deposittx).to.changeEtherBalance(addr1, -order.makingAmount);
+            // get cloneAddress and check its balance
+            const receipt = await (await deposittx).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+            expect(await weth.balanceOf(cloneAddress)).to.equal(order.makingAmount);
 
-            let orderMakerBalance = await ethOrders.ordersMakersBalances(orderHash);
-            expect(orderMakerBalance.balance).to.equal(ether('0.3'));
-            expect(orderMakerBalance.maker).to.equal(addr1.address);
-
-            const ethOrdersBatch = await ethOrders.ethOrdersBatch([orderHash]);
-            expect(ethOrdersBatch[0].balance).to.equal(ether('0.3'));
-            expect(ethOrdersBatch[0].maker).to.equal(addr1.address);
-
-            const signature = await signOrder(order, chainId, await swap.getAddress(), addr1);
-
+            const signature = abiCoder.encode([ABIOrder], [order]);
             /// Partial fill
             const takerTraits1 = buildTakerTraits({
                 threshold: ether('0.2'),
                 extension: order.extension,
             });
+            order.maker = cloneAddress;
             const fillTx1 = swap.fillContractOrderArgs(order, signature, ether('200'), takerTraits1.traits, takerTraits1.args);
-            await expect(fillTx1).to.changeTokenBalances(dai, [addr, ethOrders, addr1], [ether('-200'), '0', ether('200')]);
-            await expect(fillTx1).to.changeTokenBalances(weth, [addr, ethOrders, addr1], [ether('0.2'), ether('-0.2'), '0']);
+            await expect(fillTx1).to.changeTokenBalances(dai, [addr, cloneAddress, addr1], [ether('-200'), '0', ether('200')]);
+            await expect(fillTx1).to.changeTokenBalances(weth, [addr, cloneAddress, addr1], [ether('0.2'), ether('-0.2'), '0']);
 
             /// Remaining fill
             const takerTraits2 = buildTakerTraits({
@@ -1007,161 +1010,402 @@ describe('LimitOrderProtocol', function () {
                 extension: order.extension,
             });
             const fillTx2 = swap.fillContractOrderArgs(order, signature, ether('100'), takerTraits2.traits, takerTraits2.args);
-            await expect(fillTx2).to.changeTokenBalances(dai, [addr, ethOrders, addr1], [ether('-100'), '0', ether('100')]);
-            await expect(fillTx2).to.changeTokenBalances(weth, [addr, ethOrders, addr1], [ether('0.1'), ether('-0.1'), '0']);
+            await expect(fillTx2).to.changeTokenBalances(dai, [addr, cloneAddress, addr1], [ether('-100'), '0', ether('100')]);
+            await expect(fillTx2).to.changeTokenBalances(weth, [addr, cloneAddress, addr1], [ether('0.1'), ether('-0.1'), '0']);
 
-            orderMakerBalance = await ethOrders.ordersMakersBalances(orderHash);
-            expect(orderMakerBalance.balance).to.equal(0);
-            expect(orderMakerBalance.maker).to.equal(addr1.address);
+            expect(await weth.balanceOf(cloneAddress)).to.equal(0);
         });
 
         it('Partial fill -> cancel -> refund maker -> fail to fill', async function () {
-            const { tokens: { dai, weth }, contracts: { swap, ethOrders }, chainId } = await loadFixture(deployContractsAndInit);
+            const { tokens: { dai, weth }, contracts: { swap, nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
             const order = buildOrder(
                 {
-                    maker: await ethOrders.getAddress(),
+                    maker: addr1.address,
                     receiver: addr1.address,
                     makerAsset: await weth.getAddress(),
                     takerAsset: await dai.getAddress(),
                     makingAmount: ether('0.3'),
                     takingAmount: ether('300'),
                 },
-                {
-                    postInteraction: await ethOrders.getAddress(),
-                },
+                {},
             );
-            const orderHash = await swap.hashOrder(order);
 
-            const deposittx = ethOrders.connect(addr1).ethOrderDeposit(order, order.extension, { value: ether('0.3') });
-            await expect(deposittx).to.changeEtherBalance(addr1, ether('-0.3'));
-            await expect(deposittx).to.changeTokenBalance(weth, ethOrders, ether('0.3'));
+            const deposittx = nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount });
+            await expect(deposittx).to.changeEtherBalance(addr1, -order.makingAmount);
+            // get cloneAddress and check its balance
+            const receipt = await (await deposittx).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+            expect(await weth.balanceOf(cloneAddress)).to.equal(order.makingAmount);
 
-            const signature = await signOrder(order, chainId, await swap.getAddress(), addr1);
+            const signature = abiCoder.encode([ABIOrder], [order]);
 
             /// Partial fill
             const fillTakerTraits = buildTakerTraits({
                 threshold: ether('0.2'),
                 extension: order.extension,
             });
+            const originalOrder = { ...order };
+            order.maker = cloneAddress;
             const fillTx = swap.fillContractOrderArgs(order, signature, ether('200'), fillTakerTraits.traits, fillTakerTraits.args);
-            await expect(fillTx).to.changeTokenBalances(dai, [addr, ethOrders, addr1], [ether('-200'), '0', ether('200')]);
-            await expect(fillTx).to.changeTokenBalances(weth, [addr, ethOrders, addr1], [ether('0.2'), ether('-0.2'), '0']);
+            await expect(fillTx).to.changeTokenBalances(dai, [addr, cloneAddress, addr1], [ether('-200'), '0', ether('200')]);
+            await expect(fillTx).to.changeTokenBalances(weth, [addr, cloneAddress, addr1], [ether('0.2'), ether('-0.2'), '0']);
 
             /// Cancel order
-            const canceltx = ethOrders.connect(addr1).cancelOrder(order.makerTraits, orderHash);
-            await expect(canceltx).to.changeTokenBalance(weth, ethOrders, ether('-0.1'));
-            await expect(canceltx).to.changeEtherBalance(addr1, ether('0.1'));
-
-            /// Remaining fill failure
-            const takerTraits = buildTakerTraits({
-                threshold: ether('0.1'),
-                extension: order.extension,
-            });
-            await expect(swap.fillContractOrderArgs(order, signature, ether('100'), takerTraits.traits, takerTraits.args))
-                .to.be.revertedWithCustomError(swap, 'InvalidatedOrder');
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            const cancelTx = clone.connect(addr1).cancelOrder(originalOrder);
+            await expect(cancelTx).to.changeTokenBalance(weth, cloneAddress, ether('-0.1'));
+            await expect(cancelTx).to.changeEtherBalance(addr1, ether('0.1'));
         });
 
-        it('Invalid order (missing post-interaction)', async function () {
-            const { tokens: { dai, weth }, contracts: { ethOrders } } = await loadFixture(deployContractsAndInit);
-
-            const order = buildOrder({
-                maker: await ethOrders.getAddress(),
-                receiver: addr1.address,
-                makerAsset: await weth.getAddress(),
-                takerAsset: await dai.getAddress(),
-                makingAmount: ether('0.3'),
-                takingAmount: ether('300'),
-            });
-
-            await expect(ethOrders.connect(addr1).ethOrderDeposit(order, order.extension, { value: ether('0.3') }))
-                .to.be.revertedWithCustomError(ethOrders, 'InvalidOrder');
-        });
-
-        it('Invalid extension (empty extension)', async function () {
-            const { tokens: { dai, weth }, contracts: { ethOrders }, orderLibFactory } = await loadFixture(deployContractsAndInit);
+        it('Create native order fails for existing order', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
 
             const order = buildOrder(
                 {
-                    maker: await ethOrders.getAddress(),
+                    maker: addr1.address,
                     receiver: addr1.address,
                     makerAsset: await weth.getAddress(),
                     takerAsset: await dai.getAddress(),
                     makingAmount: ether('0.3'),
                     takingAmount: ether('300'),
                 },
-                {
-                    postInteraction: await ethOrders.getAddress(),
-                },
+                {},
             );
 
-            await expect(ethOrders.connect(addr1).ethOrderDeposit(order, '0x', { value: ether('0.3') }))
-                .to.be.revertedWithCustomError(orderLibFactory, 'MissingOrderExtension');
-        });
+            await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount });
 
-        it('Invalid extension (mismatched extension)', async function () {
-            const { tokens: { dai, weth }, contracts: { ethOrders }, orderLibFactory } = await loadFixture(deployContractsAndInit);
-
-            const order = buildOrder(
-                {
-                    maker: await ethOrders.getAddress(),
-                    receiver: addr1.address,
-                    makerAsset: await weth.getAddress(),
-                    takerAsset: await dai.getAddress(),
-                    makingAmount: ether('0.3'),
-                    takingAmount: ether('300'),
-                },
-                {
-                    postInteraction: await ethOrders.getAddress(),
-                },
-            );
-
-            await expect(ethOrders.connect(addr1).ethOrderDeposit(order, order.extension.slice(0, -6), { value: ether('0.3') }))
-                .to.be.revertedWithCustomError(orderLibFactory, 'InvalidExtensionHash');
-        });
-
-        it('Invalid signature', async function () {
-            const { tokens: { dai, weth }, contracts: { ethOrders, swap }, chainId } = await loadFixture(deployContractsAndInit);
-
-            const order = buildOrder(
-                {
-                    maker: await ethOrders.getAddress(),
-                    receiver: addr1.address,
-                    makerAsset: await weth.getAddress(),
-                    takerAsset: await dai.getAddress(),
-                    makingAmount: ether('0.3'),
-                    takingAmount: ether('300'),
-                },
-                {
-                    postInteraction: await ethOrders.getAddress(),
-                },
-            );
-            const orderHash = await swap.hashOrder(order);
-
-            const deposittx = ethOrders.connect(addr1).ethOrderDeposit(order, order.extension, { value: ether('0.3') });
-            await expect(deposittx).to.changeEtherBalance(addr1, ether('-0.3'));
-            await expect(deposittx).to.changeTokenBalance(weth, ethOrders, ether('0.3'));
-
-            let orderMakerBalance = await ethOrders.ordersMakersBalances(orderHash);
-            expect(orderMakerBalance.balance).to.equal(ether('0.3'));
-            expect(orderMakerBalance.maker).to.equal(addr1.address);
-
-            const ethOrdersBatch = await ethOrders.ethOrdersBatch([orderHash]);
-            expect(ethOrdersBatch[0].balance).to.equal(ether('0.3'));
-            expect(ethOrdersBatch[0].maker).to.equal(addr1.address);
-
-            const signature = await signOrder(order, chainId, await swap.getAddress(), addr);
-
-            const takerTraits1 = buildTakerTraits({
-                threshold: ether('0.2'),
-                extension: order.extension,
-            });
             await expect(
-                swap.fillContractOrderArgs(order, signature, ether('200'), takerTraits1.traits, takerTraits1.args),
-            ).to.be.revertedWithCustomError(swap, 'BadSignature');
+                nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount }),
+            ).to.be.revertedWithCustomError(nativeOrderFactory, 'FailedDeployment');
+        });
 
-            orderMakerBalance = await ethOrders.ordersMakersBalances(orderHash);
-            expect(orderMakerBalance.balance).to.equal(ether('0.3'));
-            expect(orderMakerBalance.maker).to.equal(addr1.address);
+        it('Create native order fails if maker isn\'t sender', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const order = buildOrder(
+                {
+                    maker: addr2.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                },
+                {},
+            );
+
+            await expect(
+                nativeOrderFactory.connect(addr1).create(order),
+            ).to.be.revertedWithCustomError(nativeOrderFactory, 'OrderMakerShouldBeMsgSender');
+        });
+
+        it('Create native order fails with zero receiver', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: constants.ZERO_ADDRESS,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                },
+                {},
+            );
+
+            await expect(
+                nativeOrderFactory.connect(addr1).create(order),
+            ).to.be.revertedWithCustomError(nativeOrderFactory, 'OrderReceiverShouldBeSetCorrectly');
+        });
+
+        it('Create native order fails if receiver is nativeOrderFactory address', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: await nativeOrderFactory.getAddress(),
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                },
+                {},
+            );
+
+            await expect(
+                nativeOrderFactory.connect(addr1).create(order),
+            ).to.be.revertedWithCustomError(nativeOrderFactory, 'OrderReceiverShouldBeSetCorrectly');
+        });
+
+        it('Create native order fails with incorrect values', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                },
+                {},
+            );
+
+            await expect(
+                nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount + 1n }),
+            ).to.be.revertedWithCustomError(nativeOrderFactory, 'OrderMakingAmountShouldBeEqualToMsgValue');
+
+            await expect(
+                nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount - 1n }),
+            ).to.be.revertedWithCustomError(nativeOrderFactory, 'OrderMakingAmountShouldBeEqualToMsgValue');
+        });
+
+        it('Resolver cancellation expired order with reward', async function () {
+            if (hre.__SOLIDITY_COVERAGE_RUNNING) { this.skip(); }
+
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+
+            await time.increaseTo(expirationTime + 60);
+            await network.provider.send('hardhat_setNextBlockBaseFeePerGas', ['0x2540be400']); // 10 gwei
+
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            const cancelTx = clone.connect(addr2).cancelExpiredOrderByResolver(order, order.makingAmount);
+
+            await expect(cancelTx).to.changeTokenBalance(weth, cloneAddress, ether('-0.3'));
+            await expect(cancelTx).to.emit(clone, 'NativeOrderCancelledByResolver');
+
+            const reward = 70000n * parseUnits('11', 9); // 110% of base fee
+
+            await expect(cancelTx).to.changeEtherBalances([addr1, addr2], [ether('0.3') - reward, reward]);
+        });
+
+        it('Resolver cancellation without reward just after expired', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+
+            await time.increaseTo(expirationTime);
+
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            const cancelTx = clone.connect(addr2).cancelExpiredOrderByResolver(order, 0);
+
+            await expect(cancelTx).to.changeTokenBalance(weth, cloneAddress, ether('-0.3'));
+            await expect(cancelTx).to.emit(clone, 'NativeOrderCancelledByResolver');
+
+            await expect(cancelTx).to.changeEtherBalances([addr1, addr2], [ether('0.3'), 0]);
+        });
+
+        it('Resolver cancellation fails before expiration', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            await time.increaseTo(expirationTime - 2);
+
+            await expect(
+                clone.connect(addr2).cancelExpiredOrderByResolver(order, 0),
+            ).to.be.revertedWithCustomError(clone, 'OrderShouldBeExpired');
+        });
+
+        it('Resolver cancellation fails if reward requested before 1 minute after order expiry', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+
+            await time.increaseTo(expirationTime + 58);
+
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            await expect(
+                clone.connect(addr2).cancelExpiredOrderByResolver(order, order.makingAmount),
+            ).to.be.revertedWithCustomError(clone, 'CancellationDelayViolation');
+        });
+
+        it('Resolver cancellation fails without access token', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            await time.increaseTo(expirationTime);
+
+            await expect(
+                clone.connect(addr3).cancelExpiredOrderByResolver(order, 0),
+            ).to.be.revertedWithCustomError(clone, 'ResolverAccessTokenMissing');
+        });
+
+        it('Resolver cancellation fails if call twice', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            await time.increaseTo(expirationTime);
+
+            await clone.connect(addr2).cancelExpiredOrderByResolver(order, 0);
+            await expect(
+                clone.connect(addr2).cancelExpiredOrderByResolver(order, 0),
+            ).to.be.revertedWithCustomError(clone, 'CanNotCancelForZeroBalance');
+        });
+
+        it('Maker can call withdraw WETH from clone', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            const tx = clone.connect(addr1).withdraw(
+                order,
+                await weth.getAddress(),
+                0,
+                weth.interface.encodeFunctionData('transfer', [addr1.address, ether('0.3')]),
+            );
+            await expect(tx).to.changeTokenBalances(weth, [cloneAddress, addr1.address], [ether('-0.3'), ether('0.3')]);
+        });
+
+        it('Can\'t call withdraw, if caller is not a maker', async function () {
+            const { tokens: { dai, weth }, contracts: { nativeOrderFactory } } = await loadFixture(deployContractsAndInit);
+
+            const expirationTime = await time.latest() + time.duration.hours(1);
+
+            const order = buildOrder(
+                {
+                    maker: addr1.address,
+                    receiver: addr1.address,
+                    makerAsset: await weth.getAddress(),
+                    takerAsset: await dai.getAddress(),
+                    makingAmount: ether('0.3'),
+                    takingAmount: ether('300'),
+                    makerTraits: buildMakerTraits({ expiry: expirationTime }),
+                },
+                {},
+            );
+
+            const receipt = await (await nativeOrderFactory.connect(addr1).create(order, { value: order.makingAmount })).wait();
+            const cloneAddress = getEventArgs(receipt, nativeOrderFactory.interface, 'NativeOrderCreated')[2]; // index 2 is clone address
+            const clone = await ethers.getContractAt('NativeOrderImpl', cloneAddress);
+            await expect(
+                clone.connect(addr2).withdraw(
+                    order,
+                    await weth.getAddress(),
+                    0,
+                    weth.interface.encodeFunctionData('transfer', [addr1.address, ether('0.3')]),
+                ),
+            ).to.be.revertedWithCustomError(clone, 'OnlyMakerViolation');
         });
     });
 

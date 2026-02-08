@@ -3,6 +3,7 @@ const { SignatureTransfer, PERMIT2_ADDRESS } = require('@uniswap/permit2-sdk');
 const { ether } = require('./helpers/utils');
 const { signOrder, buildOrder, buildTakerTraits, buildMakerTraitsRFQ } = require('./helpers/orderUtils');
 const { deploySwapTokens } = require('./helpers/fixtures');
+const { nextPermit2Nonce } = require('./helpers/nonce');
 const hre = require('hardhat');
 const { ethers } = hre;
 
@@ -20,7 +21,6 @@ describe('WitnessProxyExample', function () {
 
         await dai.mint(addr, ether('2000'));
         await weth.connect(addr1).deposit({ value: ether('1') });
-
         await dai.approve(swap, ether('2000'));
         await weth.connect(addr1).approve(PERMIT2_ADDRESS, ether('1'));
 
@@ -36,7 +36,7 @@ describe('WitnessProxyExample', function () {
                 amount: ether('1'),
             },
             spender: await permit2WitnessProxy.getAddress(),
-            nonce: 0,
+            nonce: nextPermit2Nonce(),
             deadline: 0xffffffff,
         };
 
@@ -49,7 +49,7 @@ describe('WitnessProxyExample', function () {
         const data = SignatureTransfer.getPermitData(
             permit,
             PERMIT2_ADDRESS,
-            31337,
+            chainId,
             witness,
         );
 

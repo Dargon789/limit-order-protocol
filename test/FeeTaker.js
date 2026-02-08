@@ -3,13 +3,13 @@ const { ethers } = hre;
 const { expect } = require('@1inch/solidity-utils');
 const { loadFixture } = require('@nomicfoundation/hardhat-network-helpers');
 const { deploySwapTokens } = require('./helpers/fixtures');
-const { buildOrder, buildTakerTraits, signOrder, buildMakerTraits } = require('./helpers/orderUtils');
+const { buildOrder, buildTakerTraits, signOrder, buildMakerTraits, buildFeeTakerExtensions } = require('./helpers/orderUtils');
 const { ether } = require('./helpers/utils');
 
 describe('FeeTaker', function () {
-    let addr, addr1, addr2, addr3;
+    let addr, addr1, addr2, addr3, addr4;
     before(async function () {
-        [addr, addr1, addr2, addr3] = await ethers.getSigners();
+        [addr, addr1, addr2, addr3, addr4] = await ethers.getSigners();
     });
 
     async function deployContractsAndInit () {
@@ -30,7 +30,7 @@ describe('FeeTaker', function () {
         await inch.connect(addr1).approve(swap, ether('1000000'));
 
         const FeeTaker = await ethers.getContractFactory('FeeTaker');
-        const feeTaker = await FeeTaker.deploy(swap, weth, addr);
+        const feeTaker = await FeeTaker.deploy(swap, inch, weth, addr);
 
         return { dai, weth, inch, swap, chainId, feeTaker };
     };
@@ -40,24 +40,17 @@ describe('FeeTaker', function () {
 
         const makingAmount = ether('300');
         const takingAmount = ether('0.3');
-        const fee = 0;
         const feeRecipient = addr2.address;
 
         const order = buildOrder(
             {
                 maker: addr1.address,
-                receiver: await feeTaker.getAddress(),
                 makerAsset: await dai.getAddress(),
                 takerAsset: await weth.getAddress(),
                 makingAmount,
                 takingAmount,
             },
-            {
-                postInteraction: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'address'],
-                    [await feeTaker.getAddress(), fee, fee, '0x00', feeRecipient],
-                ),
-            },
+            buildFeeTakerExtensions({ feeTaker: await feeTaker.getAddress() }),
         );
 
         const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
@@ -67,7 +60,7 @@ describe('FeeTaker', function () {
         const fillTx = swap.fillOrderArgs(order, r, vs, makingAmount, takerTraits.traits, takerTraits.args);
         console.log(`GasUsed: ${(await (await fillTx).wait()).gasUsed.toString()}`);
         await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [makingAmount, -makingAmount]);
-        await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1, addr2], [-takingAmount, takingAmount, 0]);
+        await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1, feeRecipient], [-takingAmount, takingAmount, 0]);
     });
 
     it('should send all tokens to the maker receiver with 0 fee', async function () {
@@ -75,25 +68,19 @@ describe('FeeTaker', function () {
 
         const makingAmount = ether('300');
         const takingAmount = ether('0.3');
-        const fee = 0;
         const feeRecipient = addr2.address;
         const makerReceiver = addr3.address;
 
         const order = buildOrder(
             {
                 maker: addr1.address,
-                receiver: await feeTaker.getAddress(),
+                receiver: makerReceiver,
                 makerAsset: await dai.getAddress(),
                 takerAsset: await weth.getAddress(),
                 makingAmount,
                 takingAmount,
             },
-            {
-                postInteraction: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'address', 'address'],
-                    [await feeTaker.getAddress(), fee, fee, '0x00', feeRecipient, makerReceiver],
-                ),
-            },
+            buildFeeTakerExtensions({ feeTaker: await feeTaker.getAddress() }),
         );
 
         const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
@@ -103,7 +90,7 @@ describe('FeeTaker', function () {
         const fillTx = swap.fillOrderArgs(order, r, vs, makingAmount, takerTraits.traits, takerTraits.args);
         console.log(`GasUsed: ${(await (await fillTx).wait()).gasUsed.toString()}`);
         await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [makingAmount, -makingAmount]);
-        await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1, addr2, addr3], [-takingAmount, 0, 0, takingAmount]);
+        await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1, feeRecipient, makerReceiver], [-takingAmount, 0, 0, takingAmount]);
     });
 
     it('should charge fee when in whitelist', async function () {
@@ -113,8 +100,9 @@ describe('FeeTaker', function () {
         const takingAmount = ether('0.3');
         const integratorFee = BigInt(1e4);
         const resolverFee = BigInt(1e3);
-        const feeRecipient = addr2.address;
-        const whitelist = '0x' + addr.address.slice(-20).repeat(10);
+        const integratorFeeRecipient = addr2.address;
+        const protocolFeeRecipient = addr3.address;
+        const whitelist = '0x0a' + addr.address.slice(-20).repeat(10);
 
         const order = buildOrder(
             {
@@ -125,25 +113,14 @@ describe('FeeTaker', function () {
                 makingAmount,
                 takingAmount,
             },
-            {
-                // * 2 bytes — integrator fee percentage (in 1e5)
-                // * 2 bytes — resolver fee percentage (in 1e5)
-                // * 20 bytes — fee recipient
-                // * 1 byte - taker whitelist size
-                // * (bytes10)[N] — taker whitelist
-                postInteraction: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'bytes', 'address'],
-                    [await feeTaker.getAddress(), integratorFee, resolverFee, '0x0a', whitelist, feeRecipient],
-                ),
-                makingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'bytes'],
-                    [await feeTaker.getAddress(), integratorFee, resolverFee, '0x0a', whitelist],
-                ),
-                takingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'bytes'],
-                    [await feeTaker.getAddress(), integratorFee, resolverFee, '0x0a', whitelist],
-                ),
-            },
+            buildFeeTakerExtensions({
+                feeTaker: await feeTaker.getAddress(),
+                integratorFeeRecipient,
+                protocolFeeRecipient,
+                integratorFee,
+                resolverFee,
+                whitelist,
+            }),
         );
 
         const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
@@ -154,9 +131,15 @@ describe('FeeTaker', function () {
         const fillTx = swap.fillOrderArgs(order, r, vs, makingAmount, takerTraits.traits, takerTraits.args);
         console.log(`GasUsed: ${(await (await fillTx).wait()).gasUsed.toString()}`);
 
-        const feeCalculated = takingAmount * (integratorFee + resolverFee) / BigInt(1e5);
+        const integratorFeeCalculated = takingAmount * (integratorFee / 2n) / BigInt(1e5);
+        const protocolFeeCalculated = takingAmount * (integratorFee / 2n + resolverFee / 2n) / BigInt(1e5);
+        const totalFeeCalculated = protocolFeeCalculated + integratorFeeCalculated;
         await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [makingAmount, -makingAmount]);
-        await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1, addr2], [-takingAmount - feeCalculated, takingAmount, feeCalculated]);
+        await expect(fillTx).to.changeTokenBalances(
+            weth,
+            [addr, addr1, integratorFeeRecipient, protocolFeeRecipient],
+            [-takingAmount - totalFeeCalculated, takingAmount, integratorFeeCalculated, protocolFeeCalculated],
+        );
     });
 
     it('should charge fee when out of whitelist', async function () {
@@ -166,8 +149,9 @@ describe('FeeTaker', function () {
         const takingAmount = ether('0.3');
         const integratorFee = BigInt(1e4);
         const resolverFee = BigInt(1e3);
-        const feeRecipient = addr2.address;
-        const whitelist = '0x' + addr2.address.slice(-20).repeat(10);
+        const integratorFeeRecipient = addr2.address;
+        const protocolFeeRecipient = addr3.address;
+        const whitelist = '0x0a' + addr2.address.slice(-20).repeat(10);
 
         const order = buildOrder(
             {
@@ -178,25 +162,14 @@ describe('FeeTaker', function () {
                 makingAmount,
                 takingAmount,
             },
-            {
-                // * 2 bytes — integrator fee percentage (in 1e5)
-                // * 2 bytes — resolver fee percentage (in 1e5)
-                // * 20 bytes — fee recipient
-                // * 1 byte - taker whitelist size
-                // * (bytes10)[N] — taker whitelist
-                postInteraction: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'bytes', 'address'],
-                    [await feeTaker.getAddress(), integratorFee, resolverFee, '0x0a', whitelist, feeRecipient],
-                ),
-                makingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'bytes'],
-                    [await feeTaker.getAddress(), integratorFee, resolverFee, '0x0a', whitelist],
-                ),
-                takingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'bytes'],
-                    [await feeTaker.getAddress(), integratorFee, resolverFee, '0x0a', whitelist],
-                ),
-            },
+            buildFeeTakerExtensions({
+                feeTaker: await feeTaker.getAddress(),
+                integratorFeeRecipient,
+                protocolFeeRecipient,
+                integratorFee,
+                resolverFee,
+                whitelist,
+            }),
         );
 
         const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
@@ -207,11 +180,13 @@ describe('FeeTaker', function () {
         const fillTx = swap.fillOrderArgs(order, r, vs, makingAmount, takerTraits.traits, takerTraits.args);
         console.log(`GasUsed: ${(await (await fillTx).wait()).gasUsed.toString()}`);
 
-        const feeCalculated = takingAmount * (integratorFee + resolverFee + resolverFee) / BigInt(1e5);
+        const integratorFeeCalculated = takingAmount * (integratorFee / 2n) / BigInt(1e5);
+        const protocolFeeCalculated = takingAmount * (integratorFee / 2n + resolverFee) / BigInt(1e5);
+        const totalFeeCalculated = protocolFeeCalculated + integratorFeeCalculated;
         await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [makingAmount, -makingAmount]);
         await expect(fillTx).to.changeTokenBalances(weth,
-            [addr, addr1, addr2],
-            [-takingAmount - feeCalculated, takingAmount, feeCalculated],
+            [addr, addr1, integratorFeeRecipient, protocolFeeRecipient],
+            [-takingAmount - totalFeeCalculated, takingAmount, integratorFeeCalculated, protocolFeeCalculated],
         );
     });
 
@@ -220,10 +195,10 @@ describe('FeeTaker', function () {
 
         const makingAmount = ether('300');
         const takingAmount = ether('0.3');
-        const fee = BigInt(1e4);
-        const feeCalculated = takingAmount * fee / BigInt(1e5);
-        const feeRecipient = addr2.address;
-        const makerReceiver = addr3.address;
+        const integratorFee = BigInt(1e4);
+        const integratorFeeRecipient = addr2.address;
+        const protocolFeeRecipient = addr3.address;
+        const makerReceiver = addr4.address;
 
         const order = buildOrder(
             {
@@ -234,20 +209,13 @@ describe('FeeTaker', function () {
                 makingAmount,
                 takingAmount,
             },
-            {
-                postInteraction: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'address', 'address'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00', feeRecipient, makerReceiver],
-                ),
-                makingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00'],
-                ),
-                takingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00'],
-                ),
-            },
+            buildFeeTakerExtensions({
+                feeTaker: await feeTaker.getAddress(),
+                integratorFeeRecipient,
+                protocolFeeRecipient,
+                makerReceiver,
+                integratorFee,
+            }),
         );
 
         const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
@@ -256,8 +224,16 @@ describe('FeeTaker', function () {
         });
         const fillTx = swap.fillOrderArgs(order, r, vs, makingAmount, takerTraits.traits, takerTraits.args);
         console.log(`GasUsed: ${(await (await fillTx).wait()).gasUsed.toString()}`);
+
+        const integratorFeeCalculated = takingAmount * integratorFee / 2n / BigInt(1e5);
+        const protocolFeeCalculated = takingAmount * integratorFee / 2n / BigInt(1e5);
+        const totalFeeCalculated = integratorFeeCalculated + protocolFeeCalculated;
+
         await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [makingAmount, -makingAmount]);
-        await expect(fillTx).to.changeTokenBalances(weth, [addr, addr1, addr2, addr3], [-takingAmount - feeCalculated, 0, feeCalculated, takingAmount]);
+        await expect(fillTx).to.changeTokenBalances(
+            weth,
+            [addr, addr1, integratorFeeRecipient, protocolFeeRecipient, makerReceiver],
+            [-takingAmount - totalFeeCalculated, 0, integratorFeeCalculated, protocolFeeCalculated, takingAmount]);
     });
 
     it('should charge fee in eth', async function () {
@@ -265,9 +241,10 @@ describe('FeeTaker', function () {
 
         const makingAmount = ether('300');
         const takingAmount = ether('0.3');
-        const fee = BigInt(1e4);
-        const feeCalculated = takingAmount * fee / BigInt(1e5);
-        const feeRecipient = addr2.address;
+        const integratorFee = BigInt(1e4);
+        const feeCalculated = takingAmount * integratorFee / BigInt(1e5);
+        const integratorFeeRecipient = addr2.address;
+        const protocolFeeRecipient = addr3.address;
 
         const order = buildOrder(
             {
@@ -279,20 +256,12 @@ describe('FeeTaker', function () {
                 takingAmount,
                 makerTraits: buildMakerTraits({ unwrapWeth: true }),
             },
-            {
-                postInteraction: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'address'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00', feeRecipient],
-                ),
-                makingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00'],
-                ),
-                takingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00'],
-                ),
-            },
+            buildFeeTakerExtensions({
+                feeTaker: await feeTaker.getAddress(),
+                integratorFeeRecipient,
+                protocolFeeRecipient,
+                integratorFee,
+            }),
         );
 
         const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
@@ -303,7 +272,7 @@ describe('FeeTaker', function () {
         console.log(`GasUsed: ${(await (await fillTx).wait()).gasUsed.toString()}`);
         await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [makingAmount, -makingAmount]);
         await expect(fillTx).to.changeTokenBalance(weth, addr, -takingAmount - feeCalculated);
-        await expect(fillTx).to.changeEtherBalances([addr1, addr2], [takingAmount, feeCalculated]);
+        await expect(fillTx).to.changeEtherBalances([addr1, integratorFeeRecipient, protocolFeeRecipient], [takingAmount, feeCalculated / 2n, feeCalculated / 2n]);
     });
 
     it('should charge fee in eth and send the rest to the maker receiver', async function () {
@@ -311,10 +280,11 @@ describe('FeeTaker', function () {
 
         const makingAmount = ether('300');
         const takingAmount = ether('0.3');
-        const fee = BigInt(1e4);
-        const feeCalculated = takingAmount * fee / BigInt(1e5);
-        const feeRecipient = addr2.address;
-        const makerReceiver = addr3.address;
+        const integratorFee = BigInt(1e4);
+        const feeCalculated = takingAmount * integratorFee / BigInt(1e5);
+        const integratorFeeRecipient = addr2.address;
+        const protocolFeeRecipient = addr3.address;
+        const makerReceiver = addr4.address;
 
         const order = buildOrder(
             {
@@ -326,20 +296,13 @@ describe('FeeTaker', function () {
                 takingAmount,
                 makerTraits: buildMakerTraits({ unwrapWeth: true }),
             },
-            {
-                postInteraction: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1', 'address', 'address'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00', feeRecipient, makerReceiver],
-                ),
-                makingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00'],
-                ),
-                takingAmountData: ethers.solidityPacked(
-                    ['address', 'uint16', 'uint16', 'bytes1'],
-                    [await feeTaker.getAddress(), fee, 0, '0x00'],
-                ),
-            },
+            buildFeeTakerExtensions({
+                feeTaker: await feeTaker.getAddress(),
+                integratorFeeRecipient,
+                protocolFeeRecipient,
+                makerReceiver,
+                integratorFee,
+            }),
         );
 
         const { r, yParityAndS: vs } = ethers.Signature.from(await signOrder(order, chainId, await swap.getAddress(), addr1));
@@ -350,6 +313,6 @@ describe('FeeTaker', function () {
         console.log(`GasUsed: ${(await (await fillTx).wait()).gasUsed.toString()}`);
         await expect(fillTx).to.changeTokenBalances(dai, [addr, addr1], [makingAmount, -makingAmount]);
         await expect(fillTx).to.changeTokenBalance(weth, addr, -takingAmount - feeCalculated);
-        await expect(fillTx).to.changeEtherBalances([addr1, addr2, addr3], [0, feeCalculated, takingAmount]);
+        await expect(fillTx).to.changeEtherBalances([addr1, integratorFeeRecipient, protocolFeeRecipient, makerReceiver], [0, feeCalculated / 2n, feeCalculated / 2n, takingAmount]);
     });
 });
