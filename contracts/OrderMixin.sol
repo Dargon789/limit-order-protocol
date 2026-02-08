@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity 0.8.23;
+pragma solidity 0.8.30;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
@@ -257,7 +257,7 @@ abstract contract OrderMixin is IOrderMixin, EIP712, PredicateHelper, SeriesEpoc
       * @param takerTraits The taker preferences for the order.
       * @param target The address to which the order is filled.
       * @param interaction The interaction calldata.
-      * @return makingAmount The computed amount that the maker will get.
+      * @return makingAmount The computed amount that the maker will send.
       * @return takingAmount The computed amount that the taker will send.
       */
     function _fill(
