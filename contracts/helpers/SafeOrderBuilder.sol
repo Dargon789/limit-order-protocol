@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity 0.8.23;
+pragma solidity 0.8.30;
 
 import { AggregatorV3Interface } from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import { GnosisSafeStorage } from "@gnosis.pm/safe-contracts/contracts/examples/libraries/GnosisSafeStorage.sol";
@@ -15,6 +15,8 @@ import { IOrderRegistrator } from "../interfaces/IOrderRegistrator.sol";
  * The contract uses oracles to adjust the order taking amount based on the volatility of the maker and taker assets.
  */
 contract SafeOrderBuilder is GnosisSafeStorage {
+    using Math for uint256;
+
     error StaleOraclePrice();
 
     bytes32 private constant _SAFE_MSG_TYPEHASH = keccak256("SafeMessage(bytes message)");
@@ -53,7 +55,7 @@ contract SafeOrderBuilder is GnosisSafeStorage {
             (, int256 latestAnswer,, uint256 updatedAt,) = makerAssetOracleParams.oracle.latestRoundData();
             // solhint-disable-next-line not-rely-on-time
             if (updatedAt + makerAssetOracleParams.ttl < block.timestamp) revert StaleOraclePrice();
-            order.takingAmount = Math.mulDiv(order.takingAmount, uint256(latestAnswer), makerAssetOracleParams.originalAnswer);
+            order.takingAmount = order.takingAmount.mulDiv(uint256(latestAnswer), makerAssetOracleParams.originalAnswer);
         }
 
         {
@@ -61,7 +63,7 @@ contract SafeOrderBuilder is GnosisSafeStorage {
             (, int256 latestAnswer,, uint256 updatedAt,) = takerAssetOracleParams.oracle.latestRoundData();
             // solhint-disable-next-line not-rely-on-time
             if (updatedAt + takerAssetOracleParams.ttl < block.timestamp) revert StaleOraclePrice();
-            order.takingAmount = Math.mulDiv(order.takingAmount, takerAssetOracleParams.originalAnswer, uint256(latestAnswer));
+            order.takingAmount = order.takingAmount.mulDiv(takerAssetOracleParams.originalAnswer, uint256(latestAnswer));
         }
 
         bytes32 msgHash = _getMessageHash(abi.encode(_LIMIT_ORDER_PROTOCOL.hashOrder(order)));
